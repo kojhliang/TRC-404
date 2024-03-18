@@ -5,7 +5,8 @@ Official website: https://trc-404.xyz
 
 
 ## Test
-npm run test
+npm install  
+npm run test  
 
 ## Run on Testnet
 Create a new .env file in the root folder.  
