@@ -1,0 +1,178 @@
+#include "./utils/stdlib.fc";
+#include "./message/common_message.fc";
+#include "./utils/sendMessage.fc";
+#include "./message/master_message.fc";
+#include "./message/wallet_message.fc";
+#include "./message/nftCollection_message.fc";
+#include "./init/wallet_init.fc";
+#include "./utils/string.fc";
+
+int max_supply()     asm "100000000000000 PUSHINT"; ;; max supply of Jetton and NFT is 100000 pieces,i.e 100000 * 10^9
+int min_txFee()      asm  "130000000 PUSHINT"; ;;0.13 ton ;; min mint tx fee ,init is 0.15 ton for client side
+int one_ton()        asm "1000000000 PUSHINT"; ;;1 ton 
+int mint_gas()       asm  "120000000 PUSHINT";    ;;0.14 ton
+;;int free_mint_txFee()     asm  "140000000 PUSHINT"; ;;0.14 ton ;; min freeMint/freemint tx fee
+
+
+(int, slice,slice, cell, cell,int,int,int,int,int) load_data() inline {
+  slice ds = get_data().begin_parse();
+  return (
+      ds~load_coins(), ;; total_supply
+      ds~load_msg_addr(), ;; admin_address
+      ds~load_msg_addr(), ;; nft_collection_address
+      ds~load_ref(), ;; content
+      ds~load_ref(),  ;; jetton_wallet_code
+      ds~load_int(2), ;;FreeMint flag, -1:true,0:false
+      ds~load_coins(), ;;FreeMint freemint_current_supply , freemint_current_supply<= freemint_max_supply
+      ds~load_coins(), ;;freemint/FreeMint freemint_max_supply  , (freemint_max_supply + total_supply) <= max_supply()
+      ds~load_coins(), ;; freemint_price, like 5* 10^9 nano ton
+      ds~load_int(2) ;; mintable, -1:true,0:false
+  );
+}
+
+() save_data(int total_supply, slice admin_address,slice nft_collection_address, cell content, cell jetton_wallet_code,
+            int freemint_flag,int freemint_current_supply, int freemint_max_supply,int freemint_price,int mintable) impure inline {
+  set_data(begin_cell()
+            .store_coins(total_supply)
+            .store_slice(admin_address)
+            .store_slice(nft_collection_address)
+            .store_ref(content)
+            .store_ref(jetton_wallet_code)
+            .store_int(freemint_flag,2)
+            .store_coins(freemint_current_supply)
+            .store_coins(freemint_max_supply)
+            .store_coins(freemint_price)
+            .store_int(mintable,2)
+           .end_cell()
+          );
+}
+
+
+() recv_internal(int my_balance,int msg_value, cell in_msg_full, slice in_msg_body) impure { 
+    (int total_supply, slice admin_address,slice nft_collection_address, cell content, cell jetton_wallet_code,
+           int freemint_flag,int freemint_current_supply, int freemint_max_supply,int freemint_price,int mintable) = load_data();
+    
+    var ctx = var (flags,sender_address,fwd_fee) = load_in_msg_full(in_msg_full);
+    if (flags & 1) { ;;ignore  bounced messages
+        return ();
+    }  
+
+    if (in_msg_body.slice_empty?()) { 
+        throw_unless(300,freemint_flag);  ;; exit if freemint flag  is false(0)
+        ;; throw_unless(301, msg_value > freemint_price + min_txFee() );  ;; exit if msg_value less than one FT price + min_txFee() (at least mint/buy one FT)
+        ;; int mint_amount = msg_value / ( freemint_price + min_txFee()); ;;should support decimal (10^9)
+
+        ;; deduct gas fee from msg_value
+        throw_unless(301, msg_value >= freemint_price );  ;; exit if msg_value less than one FT price (at least mint/buy one FT)
+        int mint_nft_number = msg_value  / freemint_price;  ;; nft number need to mint
+        int mint_jetton_amount = msg_value * one_ton() / freemint_price; ;;should support decimal (10^9)
+
+        throw_unless(302, max_supply() >=  (total_supply + mint_jetton_amount) ); ;; exit if exceed max total supply
+        throw_unless(303, freemint_max_supply >= (freemint_current_supply + mint_jetton_amount) ); ;; exit if exceed max supply
+
+        if( max_supply() == (total_supply + mint_jetton_amount) ){
+             mintable = 0; ;;reach max_supply ,stop mint new FT
+        }
+        ;;add freemint_current_supply
+        freemint_current_supply = freemint_current_supply + mint_jetton_amount;
+
+        int gas_fee = mint_gas() *  mint_nft_number ;
+
+        ;; send internalTransfer message to receiver waller,because not sure user has deployed  wallet,so send message with stat_init
+       var (state_init,to_wallet_address)  = getJettonWallet_InitStateAndAddress(sender_address,my_address(),jetton_wallet_code,nft_collection_address);
+         sendMsgWithInitState(bounce::true(),
+                             sendMode::NONE(),
+                             to_wallet_address,gas_fee,
+                             internalTransferMsg(11,mint_jetton_amount,my_address(),sender_address,0,""),
+                             state_init);   
+        save_data(total_supply + mint_jetton_amount, admin_address,nft_collection_address, content, jetton_wallet_code,
+                  freemint_flag, freemint_current_supply,  freemint_max_supply, freemint_price,mintable);
+        return ();
+    }
+
+ 
+    int op = in_msg_body~load_uint(32);
+
+    ;;********begin to handle message
+  
+    if ( op == op::deployMaster() ){
+      int query_id = load_DeployMasterMsg(in_msg_body);
+      sendMsg(bounce::true(),sendMode::CARRY_ALL_REMAINING_INCOMING_VALUE(),
+              nft_collection_address,0,
+              initCollectionMsg(query_id,my_address(),sender_address));
+      return();
+    }
+
+    if (op == op::mint()) {
+       var (query_id, to_address, jetton_amount) = load_MintMsg(in_msg_body);
+        throw_unless(73, equal_slices(sender_address, admin_address));   ;;   exit if not admin_address 
+        throw_unless(500, max_supply() >= (total_supply + jetton_amount) ); ;; exit if exceed max supply
+
+        if( max_supply() == (total_supply + jetton_amount) ){
+             mintable = 0; ;;reach max_supply ,stop mint new FT
+        }
+
+       ;; send internalTransfer message to receiver waller,because not sure user has deployed  wallet,so send message with stat_init
+       var (state_init,to_wallet_address)  = getJettonWallet_InitStateAndAddress(to_address,my_address(),jetton_wallet_code,nft_collection_address);
+         sendMsgWithInitState(bounce::true(),
+                             sendMode::CARRY_ALL_REMAINING_INCOMING_VALUE(),
+                             to_wallet_address,0,
+                             internalTransferMsg(query_id,jetton_amount,my_address(),sender_address,0,""),
+                             state_init);   
+        save_data(total_supply + jetton_amount, admin_address,nft_collection_address, content, jetton_wallet_code,
+                  freemint_flag, freemint_current_supply,  freemint_max_supply, freemint_price,mintable);
+        return ();
+    }
+
+    
+
+    if (op == op::change_admin() ) { ;; change admin
+        throw_unless(75, equal_slices(sender_address, admin_address));
+        var (query_id, new_admin_address) = load_ChangeAdminMsg(in_msg_body);
+        sendMsg(bounce::false(),sendMode::CARRY_ALL_REMAINING_INCOMING_VALUE(),
+                sender_address,0,excessesMsg(0));
+        save_data(total_supply, new_admin_address,nft_collection_address, content, jetton_wallet_code,
+                   freemint_flag, freemint_current_supply,  freemint_max_supply, freemint_price,mintable);
+        return ();
+    }
+
+    if (op == op::change_freemint_config() ) { ;; change freemint config
+        throw_unless(75, equal_slices(sender_address, admin_address));
+        var (query_id,new_freemint_flag, new_freemint_max_supply,new_freemint_price) = load_ChangeFreemintConfigMsg(in_msg_body);
+        throw_unless(304, new_freemint_max_supply >= freemint_current_supply);
+        sendMsg(bounce::false(),sendMode::CARRY_ALL_REMAINING_INCOMING_VALUE(),
+                sender_address,0,excessesMsg(0));
+        save_data(total_supply, admin_address,nft_collection_address, content, jetton_wallet_code,
+                   new_freemint_flag, freemint_current_supply,  new_freemint_max_supply, new_freemint_price,mintable);
+        return ();
+    }
+
+    if (op == op::withdraw() ) { ;; withdraw balannce
+        throw_unless(75, equal_slices(sender_address, admin_address));
+        var (query_id,withdraw_amount, to_address) = load_WithdrawMsg(in_msg_body);
+        throw_unless(401, my_balance - mint_gas() >= withdraw_amount); ;;need to left some balance as gas fee
+ 
+        sendMsg(bounce::false(),sendMode::NONE(),
+                   to_address,withdraw_amount ,
+                   begin_cell().end_cell());
+        return ();
+    }
+
+    throw(0xffff);
+    
+}
+
+;; get method
+(int,int, slice, cell,cell, slice,int,int,int,int) get_jetton_data() method_id {
+    (int total_supply, slice admin_address,slice nft_collection_address, cell content, cell jetton_wallet_code,
+       int freemint_flag,int freemint_current_supply, int freemint_max_supply,int freemint_price,int mintable) = load_data();
+    return (total_supply,mintable, admin_address,content,jetton_wallet_code, ;;Jetton master Standard results
+           nft_collection_address,freemint_flag,freemint_current_supply,freemint_max_supply,freemint_price);
+}
+
+slice get_wallet_address(slice owner_address) method_id {
+    (int total_supply, slice admin_address,slice nft_collection_address, cell content, cell jetton_wallet_code,
+    int freemint_flag,int freemint_current_supply, int freemint_max_supply,int freemint_price,int mintable) = load_data();
+    var (_, owner_wallet_address)  = getJettonWallet_InitStateAndAddress(owner_address,my_address(),jetton_wallet_code,nft_collection_address);
+    return  owner_wallet_address;
+}
